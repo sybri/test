@@ -1,0 +1,275 @@
+on:
+  release:
+    types: [released]
+  pull_request:
+  push:
+    branches:
+      - '**'
+    tags-ignore:
+      - '**'
+
+name: Run Unit Tests and build packages for all target platforms
+
+env:
+  # Maven credentials for publishing the AAR
+  MAVEN_REPOSITORY: https://maven.pkg.github.com/jothepro/djinni-library-template
+  MAVEN_USERNAME: jothepro
+  MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+  # NuGet credentials for publishing the NuGet package for .NET Core
+  NUGET_REPOSITORY: https://nuget.pkg.github.com/jothepro/index.json
+  NUGET_USERNAME: jothepro
+  NUGET_PASSWORD: ${{ secrets.NUGET_PASSWORD }}
+  # Conan credentials for publishing the raw conan artifacts.
+  CONAN_REPOSITORY: https://gitlab.com/api/v4/projects/27897297/packages/conan
+  CONAN_LOGIN_USERNAME: jothepro
+  CONAN_PASSWORD: ${{ secrets.CONAN_PASSWORD }}
+  # Swiftpackage
+  SWIFTPACKAGE_GITSERVER: github.com/jothepro
+  SWIFTPACKAGE_REPOSITORY: djinni-library-template-swiftpackage
+  SWIFTPACKAGE_REPOSITORY_USERNAME: jothepro
+  SWIFTPACKAGE_REPOSITORY_PASSWORD: ${{ secrets.REPOSITORY_ACCESS_TOKEN }}
+  # Compile time environment settings
+  XCODE_VERSION: 13.4.1
+  GCC_VERSION: 11
+  PYTHON_VERSION: '3.10'
+
+jobs:
+  version:
+    name: get version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+      - name: determine version from latest git tag
+        id: git_describe
+        run: |
+          version_tag=`git describe --tags`
+          version=${version_tag:1}
+          echo "::set-output name=version::$version"
+    outputs:
+      version: ${{ steps.git_describe.outputs.version }}
+  test:
+    name: Build & test
+    strategy:
+      matrix:
+        os: [ubuntu-20.04, macos-12, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          submodules: true
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v3
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install Python requirements
+        run: pip install -r requirements.txt
+      - name: Select wanted Xcode Version
+        if: runner.os == 'macOS'
+        run: sudo xcode-select --switch /Applications/Xcode_${{ env.XCODE_VERSION }}.app
+      - name: Set up GCC
+        if: runner.os == 'Linux'
+        uses: egor-tensin/setup-gcc@v1
+        with:
+          version: ${{ env.GCC_VERSION }}
+      - name: Detect Conan profile
+        run: conan profile new default --detect
+      - name: Configure Conan profile
+        if: runner.os == 'Linux'
+        run: |
+          conan profile update settings.compiler.libcxx=libstdc++11 default
+          conan profile update settings.compiler.version=${{ env.GCC_VERSION }} default
+      - name: Conan install
+        run: conan install --build=missing -if build .
+      - name: Conan build & test
+        run: conan build --build-folder build .
+
+  build_android:
+    name: Package for Android (AAR)
+    runs-on: ubuntu-20.04
+    needs:
+      - test
+      - version
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          submodules: true
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v3
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install Java 11
+        uses: actions/setup-java@v3.0.0
+        with:
+          distribution: 'adopt'
+          java-version: '11'
+      - name: Install Python requirements
+        run: pip install -r requirements.txt
+      - name: configure, build and package
+        run: ./build.py --android x86 x86_64 armv7 armv8 --configuration debug --package aar
+      - name: publish
+        if: github.event_name == 'release'
+        run: ./gradlew publishDebugPublicationToMavenRepository -Pversion=$VERSION
+        working-directory: build/android/package/
+      - name: set version to Doxyfile
+        run: echo "PROJECT_NUMBER = $VERSION" >> Doxyfile-Java
+      - name: generate documentation
+        uses: mattnotmitt/doxygen-action@v1.9.4
+        with:
+          doxyfile-path: 'Doxyfile-Java'
+      - name: Publish generated docs to GitHub Pages
+        if: github.event_name == 'release'
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          publish_dir: docs/generated/html/java
+          destination_dir: java
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          exclude_assets: '.gitignore'
+
+  build_darwin:
+    name: Package for Darwin (swiftpackage)
+    runs-on: macos-12
+    needs:
+      - test
+      - version
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          submodules: true
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v3
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install Python requirements
+        run: pip install -r requirements.txt
+      - name: Select wanted Xcode Version
+        run: sudo xcode-select --switch /Applications/Xcode_${{ env.XCODE_VERSION }}.app
+      - name: configure, build and package
+        run: ./build.py --macos x86_64 armv8 --iphonesimulator x86_64 armv8 --iphoneos armv8 --package xcframework swiftpackage --configuration debug
+      - name: publish
+        if: github.event_name == 'release'
+        run: |
+          GIT_URL=https://$SWIFTPACKAGE_REPOSITORY_USERNAME:$SWIFTPACKAGE_REPOSITORY_PASSWORD@$SWIFTPACKAGE_GITSERVER/$SWIFTPACKAGE_REPOSITORY.git
+          git clone --depth 1 $GIT_URL
+          rm -r $SWIFTPACKAGE_REPOSITORY/bin/* && cp -r darwin/swiftpackage/* $SWIFTPACKAGE_REPOSITORY && cd $SWIFTPACKAGE_REPOSITORY
+          git add . && git commit -m "version $VERSION" && git tag $VERSION
+          git push && git push --tags
+        working-directory: build/
+      - name: set version to Doxyfile
+        run: echo "PROJECT_NUMBER = $VERSION" >> Doxyfile-ObjC
+      - name: generate documenation
+        run: |
+          wget https://raw.githubusercontent.com/Homebrew/homebrew-core/41828ee36b96e35b63b2a4c8cfc2df2c3728944a/Formula/doxygen.rb # v1.9.4
+          brew install graphviz doxygen.rb
+          doxygen Doxyfile-ObjC
+      - name: Publish generated docs to GitHub Pages
+        if: github.event_name == 'release'
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          publish_dir: docs/generated/html/objc
+          destination_dir: objc
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          exclude_assets: '.gitignore'
+
+  build_windows:
+    name: Package for Windows (NuGet)
+    runs-on: windows-2022
+    needs:
+      - test
+      - version
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          submodules: true
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v3
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install Python requirements
+        run: pip install -r requirements.txt
+      - name: configure, build and package
+        run: python3 ./build.py --windows x86 x86_64 armv7 armv8 --package nuget --configuration debug
+      - name: publish
+        if: github.event_name == 'release'
+        run: |
+          nuget sources add -Name nuget_server -Source $env:NUGET_REPOSITORY -username $env:NUGET_USERNAME -password $env:NUGET_PASSWORD
+          nuget push MyDjinniLibrary.$env:VERSION.symbols.nupkg -Source nuget_server -ApiKey $env:NUGET_PASSWORD
+        working-directory: build/windows/package
+      - name: set version to Doxyfile
+        run: echo "PROJECT_NUMBER = $env:VERSION" | Out-File -FilePath Doxyfile-CppCli -Encoding utf-8 -Append
+      - name: generate documentation
+        run: |
+          choco install doxygen.install --version 1.9.4
+          choco install graphviz --version 3.0.0
+          refreshenv
+          & "C:\Program Files\doxygen\bin\doxygen.exe" Doxyfile-CppCli
+      - name: Publish generated docs to GitHub Pages
+        if: github.event_name == 'release'
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          publish_dir: docs/generated/html/cppcli
+          destination_dir: cppcli
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          exclude_assets: '.gitignore'
+
+  build_linux:
+    name: Package for Linux (Conan)
+    runs-on: ubuntu-20.04
+    needs:
+      - test
+      - version
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          submodules: true
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v3
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install Python requirements
+        run: pip install -r requirements.txt
+      - name: Set up GCC
+        uses: egor-tensin/setup-gcc@v1
+        with:
+          version: ${{ env.GCC_VERSION }}
+      - name: configure, build and package
+        run: ./build.py --linux x86 x86_64 armv7 armv8 --package conan --configuration debug
+      - name: publish
+        if: github.event_name == 'release'
+        run: |
+          conan remote add conan_repository $CONAN_REPOSITORY
+          conan upload my_djinni_library/$VERSION@jothepro/release --all --remote=conan_repository
+      - name: set version to Doxyfile
+        run: echo "PROJECT_NUMBER = $VERSION" >> Doxyfile-Cpp
+      - name: generate documentation
+        uses: mattnotmitt/doxygen-action@v1.9.4
+        with:
+          doxyfile-path: 'Doxyfile-Cpp'
+      - name: Publish generated docs to GitHub Pages
+        if: github.event_name == 'release'
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          publish_dir: docs/generated/html/cpp
+          destination_dir: cpp
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          exclude_assets: '.gitignore'

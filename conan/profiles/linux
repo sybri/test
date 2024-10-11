@@ -1,0 +1,9 @@
+include(default)
+[settings]
+compiler=gcc
+os=Linux
+compiler.libcxx=libstdc++11
+compiler.version=11
+[tool_requires]
+[options]
+[env]
